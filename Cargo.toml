@@ -1,0 +1,22 @@
+[package]
+name = "ashlogin"
+version = "0.1.0"
+edition = "2024"
+description = "A terminal-first SSH login tool with Keychain-backed password auth"
+license = "MIT"
+repository = "https://github.com/life2you/AshLogin"
+homepage = "https://github.com/life2you/AshLogin"
+readme = "README.md"
+keywords = ["ssh", "terminal", "keychain", "tui", "login"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0"
+crossterm = "0.29"
+dirs = "6.0"
+keyring = { version = "3.6", features = ["apple-native"] }
+ratatui = "0.29"
+serde = { version = "1.0", features = ["derive"] }
+signal-hook = "0.3"
+ssh2 = { version = "0.9", features = ["vendored-openssl"] }
+toml = "0.9"
