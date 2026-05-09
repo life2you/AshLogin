@@ -26,6 +26,10 @@ brew tap life2you/tap
 brew install ashlogin
 ```
 
+## Release
+
+Maintainer release steps live in [RELEASING.md](/Users/life2you/vibeCodes/github/AshLogin/RELEASING.md).
+
 ## Config
 
 AshLogin looks for config in this order:
