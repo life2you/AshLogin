@@ -17,6 +17,7 @@ permissions:
 env:
   BINARY_NAME: ashlogin
   ASSET_BASENAME: ashlogin
+  FORMULA_FILENAME: ashlogin.rb
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
 
 jobs:
@@ -79,3 +80,39 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           files: release-assets/*
           generate_release_notes: true
+
+  update-homebrew-tap:
+    runs-on: ubuntu-latest
+    needs: publish-release
+    if: ${{ secrets.HOMEBREW_TAP_PUSH_TOKEN != '' }}
+
+    steps:
+      - name: Checkout tool repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Checkout homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: life2you/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_PUSH_TOKEN }}
+          path: homebrew-tap
+
+      - name: Generate updated formula
+        run: |
+          version="${RELEASE_TAG#v}"
+          ./scripts/update-homebrew-formula.sh "$version" --output "homebrew-tap/Formula/${FORMULA_FILENAME}"
+
+      - name: Commit and push tap update
+        run: |
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "Formula/${FORMULA_FILENAME}"
+          if git diff --cached --quiet; then
+            echo "No tap update needed."
+            exit 0
+          fi
+          git commit -m "Update ${ASSET_BASENAME} to ${RELEASE_TAG#v}"
+          git push origin HEAD:main
