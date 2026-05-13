@@ -11,5 +11,5 @@ This repository ships a Homebrew-installable CLI tool.
 - Do not hand-edit Homebrew SHA256 values. Use `scripts/update-homebrew-formula.sh`.
 - For local release publishing, prefer `scripts/release-and-upgrade-local.sh`. It pushes the current branch and tag, waits for the GitHub release and `homebrew-tap` update, then runs local `brew update` and `brew upgrade/install`.
 - GitHub release automation lives in `.github/workflows/release.yml` and expects the `HOMEBREW_TAP_PUSH_TOKEN` repository secret to update `life2you/homebrew-tap` automatically after a tag release.
-- When release or upgrade workflow behavior changes, update the matching release documentation in both English and Chinese, including `RELEASING.md` and `RELEASING.zh-CN.md` when they exist.
+- When a release includes new release-flow or upgrade-flow capabilities, add those upgrade highlights to the GitHub Release page notes/changelog for that version.
 - Run the relevant verification steps, at minimum `cargo test`, before shipping a release.
