@@ -84,15 +84,22 @@ jobs:
   update-homebrew-tap:
     runs-on: ubuntu-latest
     needs: publish-release
-    if: ${{ secrets.HOMEBREW_TAP_PUSH_TOKEN != '' }}
+    env:
+      HOMEBREW_TAP_PUSH_TOKEN: ${{ secrets.HOMEBREW_TAP_PUSH_TOKEN }}
 
     steps:
+      - name: Skip when tap token is unavailable
+        if: ${{ env.HOMEBREW_TAP_PUSH_TOKEN == '' }}
+        run: echo "HOMEBREW_TAP_PUSH_TOKEN is not configured; skipping tap update."
+
       - name: Checkout tool repository
+        if: ${{ env.HOMEBREW_TAP_PUSH_TOKEN != '' }}
         uses: actions/checkout@v4
         with:
           ref: ${{ env.RELEASE_TAG }}
 
       - name: Checkout homebrew tap
+        if: ${{ env.HOMEBREW_TAP_PUSH_TOKEN != '' }}
         uses: actions/checkout@v4
         with:
           repository: life2you/homebrew-tap
@@ -100,11 +107,13 @@ jobs:
           path: homebrew-tap
 
       - name: Generate updated formula
+        if: ${{ env.HOMEBREW_TAP_PUSH_TOKEN != '' }}
         run: |
           version="${RELEASE_TAG#v}"
           ./scripts/update-homebrew-formula.sh "$version" --output "homebrew-tap/Formula/${FORMULA_FILENAME}"
 
       - name: Commit and push tap update
+        if: ${{ env.HOMEBREW_TAP_PUSH_TOKEN != '' }}
         run: |
           cd homebrew-tap
           git config user.name "github-actions[bot]"
