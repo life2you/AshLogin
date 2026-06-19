@@ -1,8 +1,20 @@
 [[servers]]
 name = "prod"
-host = "192.168.1.10"
+aliases = ["p"]
+host = "203.0.113.10"
+user = "deploy"
 port = 22
-username = "deploy"
-auth_type = "password"
-keychain_service = "AshLogin"
-keychain_account = "deploy@prod"
+description = "Main production host"
+# Optional. If set, AshLogin will use `sshpass -e ssh`.
+password = "replace-me"
+identity_file = "~/.ssh/id_ed25519"
+ssh_options = ["IdentitiesOnly=yes"]
+
+[[servers]]
+name = "staging"
+aliases = ["s"]
+host = "203.0.113.20"
+user = "developer"
+port = 2222
+description = "Staging host over a custom port"
+ssh_options = ["ServerAliveInterval=30", "ServerAliveCountMax=3"]

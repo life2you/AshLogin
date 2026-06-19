@@ -2,14 +2,12 @@
 
 ## Scope
 
-This repository ships a Homebrew-installable CLI tool.
+This repository ships a small Rust CLI that reads a local config file, lets the user pick a host, and hands off to the system `ssh` client.
 
 ## AI Collaboration Rules
 
-- Prefer `gh` for GitHub operations. Before using raw `git`, `curl`, or manual browser steps for releases, workflow checks, PRs, issues, or tags, first check whether `gh` is installed and authenticated with `command -v gh` and `gh auth status`.
-- Keep `Cargo.toml`, `Cargo.lock`, release tags, packaged Homebrew formula content, and tap formula versions aligned.
-- Do not hand-edit Homebrew SHA256 values. Use `scripts/update-homebrew-formula.sh`.
-- For local release publishing, prefer `scripts/release-and-upgrade-local.sh`. It pushes the current branch and tag, waits for the GitHub release and `homebrew-tap` update, then runs local `brew update` and `brew upgrade/install`.
-- GitHub release automation lives in `.github/workflows/release.yml` and expects the `HOMEBREW_TAP_PUSH_TOKEN` repository secret to update `life2you/homebrew-tap` automatically after a tag release.
-- When a release includes new release-flow or upgrade-flow capabilities, add those upgrade highlights to the GitHub Release page notes/changelog for that version in both English and Chinese.
-- Run the relevant verification steps, at minimum `cargo test`, before shipping a release.
+- Keep the product focused on SSH login only. Do not add file upload, file download, password storage, or a custom SSH transport unless the user explicitly asks for it.
+- Prefer calling the system `ssh` binary over embedding SSH protocol logic in Rust.
+- Keep the config format human-editable and document every user-facing field in both `README.md` and `config.toml.example`.
+- Preserve support for direct login by name and interactive selection when no server name is passed.
+- Before finishing a change, run `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`.

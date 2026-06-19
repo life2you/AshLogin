@@ -1,14 +1,18 @@
 # AshLogin
 
-`AshLogin` is a terminal-first SSH account manager and login launcher for macOS.
+`AshLogin` is a small Rust CLI for one job: choose a server from a local config file and hand off to the system `ssh` client.
 
-## Current shape
+It is intentionally narrow:
 
-- `ashlogin`: list configured accounts in the terminal, choose one, and log in directly
-- `ashlogin <name>`: log in directly by account name
-- `ashlogin --conf`: open the TUI configuration manager
-- `password` auth reads passwords from macOS Keychain
-- `ssh_key` auth is supported through `ssh2`
+- no file upload or download
+- no built-in SSH implementation
+- no TUI config editor
+
+`AshLogin` keeps host metadata in `TOML`, supports direct login by server name, and falls back to an interactive picker when you run it without arguments.
+
+## Why this shape
+
+This project is the open-source version of a private server login helper. The public version keeps only the safe, reusable part: local host selection plus a normal `ssh` handoff.
 
 ## Install
 
@@ -19,73 +23,152 @@ cargo build --release
 ./target/release/ashlogin --help
 ```
 
-Homebrew tap install:
+Install with Cargo:
+
+```bash
+cargo install --path .
+```
+
+Install with Homebrew:
 
 ```bash
 brew tap life2you/tap
 brew install ashlogin
 ```
 
-## Release
+## Requirements
 
-Maintainer release steps live in [RELEASING.md](/Users/life2you/vibeCodes/github/AshLogin/RELEASING.md).
+- Rust toolchain for building from source
+- `ssh` available in `PATH`
+- `sshpass` available in `PATH` if you use password-based servers
+
+By default, `AshLogin` works well with standard SSH keys and `ssh-agent`. If a server entry includes a `password`, `AshLogin` uses `sshpass -e ssh`.
 
 ## Config
 
-AshLogin looks for config in this order:
+AshLogin resolves config in this order:
 
-1. `ASHLOGIN_CONFIG`
-2. `./config.toml`
+1. `--config /path/to/config.toml`
+2. `ASHLOGIN_CONFIG`
 3. `~/.config/ashlogin/config.toml`
 
-If no file exists, AshLogin auto-creates `~/.config/ashlogin/config.toml`.
+If the default config file does not exist, `ashlogin` creates `~/.config/ashlogin/config.toml` automatically on first launch, prints the path, and exits so you can edit it safely.
+
+You can also copy [`config.toml.example`](config.toml.example) manually if you prefer.
 
 Example:
 
 ```toml
 [[servers]]
 name = "prod"
-host = "192.168.1.10"
+aliases = ["p"]
+host = "203.0.113.10"
+user = "deploy"
 port = 22
-username = "deploy"
-auth_type = "password"
-keychain_service = "AshLogin"
-keychain_account = "deploy@prod"
+description = "Main production host"
+password = "replace-me"
+identity_file = "~/.ssh/id_ed25519"
+ssh_options = ["IdentitiesOnly=yes"]
 ```
 
-When `auth_type = "password"`, AshLogin reads the password from macOS Keychain using:
+Supported fields per server:
 
-- service: `keychain_service` or `AshLogin`
-- account: `keychain_account` or `{username}@{name}`
+- `name`: required unique display name
+- `aliases`: optional alternate names
+- `host`: required hostname or IP
+- `user`: required SSH username
+- `port`: optional, defaults to `22`
+- `description`: optional text shown in the list
+- `password`: optional plain-text password; when present, AshLogin launches `sshpass -e ssh`
+- `identity_file`: optional path passed to `ssh -i`
+- `ssh_options`: optional list of values passed as repeated `ssh -o ...`
 
-Example Keychain write:
+If `password` is present, `sshpass` must be installed. `--dry-run` hides the password and prints `SSHPASS=*** sshpass -e ssh ...`.
 
-```bash
-security add-generic-password -U -a deploy@prod -s AshLogin -w
-```
+This field is convenient but not ideal for shared configs. Do not commit real passwords into a public repository.
+
+If a password-based server is not present in `~/.ssh/known_hosts`, AshLogin will first ask whether it should fetch and save that host key before logging in.
 
 ## Usage
 
+Interactive picker:
+
 ```bash
 ashlogin
-ashlogin prod
-ashlogin --conf
 ```
 
-With `cargo run` in development:
+On first run, if the default config file is missing, AshLogin creates it and exits:
 
 ```bash
-cargo run
-cargo run -- prod
-cargo run -- --conf
-cargo run -- --help
+ashlogin
+Created a default config at /Users/you/.config/ashlogin/config.toml.
+Edit that file with your servers, then run ashlogin again.
 ```
 
-## Config TUI shortcuts
+Direct login:
 
-- `a`: add account
-- `d`: delete selected account
-- `Tab`: move between form fields while adding
-- `Enter`: next field or submit the add form
-- `Esc`: cancel the add form
-- `q`: quit the config TUI
+```bash
+ashlogin prod
+ashlogin p
+```
+
+List configured servers:
+
+```bash
+ashlogin --list
+```
+
+Preview the final SSH command:
+
+```bash
+ashlogin --dry-run prod
+```
+
+Use a specific config file:
+
+```bash
+ashlogin --config ~/.config/ashlogin/config.toml prod
+```
+
+## Example SSH handoff
+
+Given this config:
+
+```toml
+[[servers]]
+name = "staging"
+host = "203.0.113.20"
+user = "developer"
+port = 2222
+ssh_options = ["ServerAliveInterval=30"]
+```
+
+AshLogin will execute the equivalent of:
+
+```bash
+ssh -p 2222 -o ServerAliveInterval=30 developer@203.0.113.20
+```
+
+With password auth:
+
+```toml
+[[servers]]
+name = "legacy"
+host = "203.0.113.30"
+user = "root"
+password = "replace-me"
+```
+
+AshLogin will execute the equivalent of:
+
+```bash
+SSHPASS=*** sshpass -e ssh root@203.0.113.30
+```
+
+## Development
+
+```bash
+cargo fmt
+cargo clippy --all-targets -- -D warnings
+cargo test
+```

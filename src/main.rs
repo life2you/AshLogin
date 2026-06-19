@@ -1,255 +1,253 @@
 mod config;
-mod ssh;
-mod ui;
 
+use anyhow::{Context, Result, bail};
+use clap::Parser;
+use config::{Config, ConfigResolution, Server};
+use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use std::{
-    env,
-    io::{self, Write},
-    path::PathBuf,
+    fs::{self, OpenOptions},
+    io::{self, IsTerminal},
+    path::{Path, PathBuf},
+    process::{self, Command},
 };
 
-use anyhow::{Context, Result};
-use crossterm::{
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use keyring::Entry;
-use ratatui::{Terminal, backend::CrosstermBackend};
+#[derive(Debug, Parser)]
+#[command(
+    name = "ashlogin",
+    version,
+    about = "Choose a configured host and hand off to system ssh"
+)]
+struct Cli {
+    #[arg(
+        value_name = "NAME",
+        help = "Server name or alias from the config file"
+    )]
+    server: Option<String>,
 
-use crate::{
-    config::Config,
-    ui::{App, NewServerRequest, SubmitResult},
-};
+    #[arg(long, value_name = "PATH", help = "Use a specific config file")]
+    config: Option<PathBuf>,
 
-fn main() -> Result<()> {
-    let args: Vec<String> = env::args().skip(1).collect();
+    #[arg(long, help = "Print configured servers and exit")]
+    list: bool,
 
-    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
-        print_version();
-        return Ok(());
-    }
-
-    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        print_help();
-        return Ok(());
-    }
-
-    if args.len() > 1 {
-        anyhow::bail!("unexpected arguments: {}", args.join(" "));
-    }
-
-    if let Some(arg) = args.first() {
-        if arg == "--conf" {
-            let (config, config_path) = Config::load()?;
-            return run_config_tui(config, config_path);
-        }
-
-        if arg.starts_with('-') {
-            anyhow::bail!("unknown argument: {arg}");
-        }
-
-        let (config, _config_path) = Config::load()?;
-        return run_login_by_name(config, arg);
-    }
-
-    let (config, _config_path) = Config::load()?;
-    run_login_selector(config)
+    #[arg(long, help = "Print the final ssh command instead of executing it")]
+    dry_run: bool,
 }
 
-fn run_login_selector(config: Config) -> Result<()> {
-    if config.servers.is_empty() {
-        println!("No SSH accounts configured.");
-        println!("Run `ashlogin --conf` to add one.");
-        return Ok(());
+fn main() {
+    match run() {
+        Ok(code) => process::exit(code),
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            process::exit(1);
+        }
+    }
+}
+
+fn run() -> Result<i32> {
+    let cli = Cli::parse();
+    let config_path = match config::resolve_config_path(cli.config)? {
+        ConfigResolution::Ready(path) => path,
+        ConfigResolution::CreatedDefault(path) => {
+            println!(
+                "Created a default config at {}.\nEdit that file with your servers, then run ashlogin again.",
+                path.display()
+            );
+            return Ok(0);
+        }
+    };
+    let config = Config::load_from_path(&config_path)
+        .with_context(|| format!("failed to load {}", config_path.display()))?;
+
+    if cli.list {
+        print_servers(&config);
+        return Ok(0);
     }
 
-    println!("AshLogin accounts:");
-    for (index, server) in config.servers.iter().enumerate() {
-        let auth = match server.auth_type {
-            config::AuthType::Password => "password",
-            config::AuthType::SshKey => "ssh_key",
-        };
-        println!(
-            "  {}. {}  {}@{}:{}  [{}]",
-            index + 1,
-            server.name,
-            server.username,
-            server.host,
-            server.port,
-            auth
+    let server = match cli.server.as_deref() {
+        Some(name) => config.get_server(name)?,
+        None => select_server(&config)?,
+    };
+
+    if cli.dry_run {
+        println!("{}", server.preview_command()?);
+        return Ok(0);
+    }
+
+    ensure_runtime_requirements(server)?;
+    ensure_known_host(server)?;
+    launch_ssh(server)
+}
+
+fn print_servers(config: &Config) {
+    for server in &config.servers {
+        println!("{}", server.list_line());
+    }
+}
+
+fn select_server(config: &Config) -> Result<&Server> {
+    if config.servers.len() == 1 {
+        return Ok(&config.servers[0]);
+    }
+
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!(
+            "multiple servers are configured. use `ashlogin --list` or `ashlogin <name>` in non-interactive environments"
         );
     }
 
-    print!("Select account number: ");
-    io::stdout().flush().ok();
-
-    let mut input = String::new();
-    io::stdin()
-        .read_line(&mut input)
-        .context("failed to read selection")?;
-    let index = input
-        .trim()
-        .parse::<usize>()
-        .context("please enter a valid account number")?;
-
-    let server = config
-        .servers
-        .get(index.saturating_sub(1))
-        .context("selected account number is out of range")?;
-
-    ssh::connect(server)
-}
-
-fn run_login_by_name(config: Config, name: &str) -> Result<()> {
-    let server = config
+    let labels = config
         .servers
         .iter()
-        .find(|server| server.name == name)
-        .with_context(|| format!("no account named `{name}`"))?;
+        .map(Server::menu_label)
+        .collect::<Vec<_>>();
 
-    ssh::connect(server)
+    let selected = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select a server")
+        .items(&labels)
+        .default(0)
+        .interact()
+        .context("server selection aborted")?;
+
+    Ok(&config.servers[selected])
 }
 
-fn run_config_tui(config: Config, config_path: PathBuf) -> Result<()> {
-    let mut app = App::new(config);
-    app.status = format!(
-        "Loaded {}. 配置模式: a 新增, d 删除, q 退出",
-        config_path.display()
-    );
-
-    let mut terminal = setup_terminal()?;
-    let result = run_config_app(&mut terminal, &mut app, &config_path);
-    restore_terminal(&mut terminal)?;
-    result
+fn launch_ssh(server: &Server) -> Result<i32> {
+    let mut command = server.build_ssh_command()?;
+    let status = command
+        .status()
+        .with_context(|| format!("failed to launch ssh for `{}`", server.name))?;
+    Ok(status.code().unwrap_or(1))
 }
 
-fn run_config_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-    config_path: &PathBuf,
-) -> Result<()> {
-    while !app.should_quit {
-        terminal.draw(|frame| ui::render(frame, app))?;
-
-        if !event::poll(std::time::Duration::from_millis(200))? {
-            continue;
-        }
-
-        match event::read()? {
-            Event::Key(key) => {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match app.on_key(key)? {
-                    SubmitResult::None => {}
-                    SubmitResult::Save(request) => {
-                        let message = match persist_new_server(app, config_path, request) {
-                            Ok(label) => format!("{label} 已保存"),
-                            Err(error) => format!("保存失败: {}", error),
-                        };
-                        app.complete_add(message);
-                    }
-                    SubmitResult::DeleteSelected => {
-                        let message = match delete_selected_server(app, config_path) {
-                            Ok(Some(label)) => format!("{label} 已删除"),
-                            Ok(None) => "当前没有可删除的账号".to_string(),
-                            Err(error) => format!("删除失败: {}", error),
-                        };
-                        app.status = message;
-                    }
-                }
-            }
-            Event::Paste(text) => app.on_paste(&text),
-            _ => {}
-        }
+fn ensure_runtime_requirements(server: &Server) -> Result<()> {
+    if server.uses_password_auth() && !command_exists("sshpass") {
+        bail!(
+            "server `{}` uses password auth, but `sshpass` was not found in PATH",
+            server.name
+        );
     }
 
     Ok(())
 }
 
-fn persist_new_server(
-    app: &mut App,
-    config_path: &PathBuf,
-    request: NewServerRequest,
-) -> Result<String> {
-    if app
-        .config
-        .servers
-        .iter()
-        .any(|server| server.name == request.server.name)
-    {
-        anyhow::bail!("name 已存在: {}", request.server.name);
-    }
-    store_password_if_needed(&request)?;
-
-    let label = request.server.name.clone();
-    app.add_server(request.server);
-    app.config.save_to_path(config_path)?;
-    Ok(label)
+fn command_exists(program: &str) -> bool {
+    Command::new(program)
+        .arg("-V")
+        .output()
+        .map(|output| output.status.success() || output.status.code().is_some())
+        .unwrap_or(false)
 }
 
-fn delete_selected_server(app: &mut App, config_path: &PathBuf) -> Result<Option<String>> {
-    let removed = match app.remove_selected_server() {
-        Some(server) => server,
-        None => return Ok(None),
-    };
-    let label = removed.name;
-    app.config.save_to_path(config_path)?;
-    Ok(Some(label))
-}
+fn ensure_known_host(server: &Server) -> Result<()> {
+    let known_hosts_path = known_hosts_path()?;
+    let lookup = server.known_hosts_lookup();
 
-fn store_password_if_needed(request: &NewServerRequest) -> Result<()> {
-    if request.server.auth_type != config::AuthType::Password {
+    if host_exists_in_known_hosts(&lookup, &known_hosts_path)? {
         return Ok(());
     }
 
-    let password = request.password.as_deref().context("password 不能为空")?;
-    let entry = Entry::new(
-        request.server.keychain_service(),
-        &request.server.keychain_account(),
-    )
-    .context("failed to access macOS Keychain entry")?;
-    entry
-        .set_password(password)
-        .context("failed to save password to macOS Keychain")?;
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!(
+            "host `{}` is not present in {}. run interactively once to confirm and save its host key",
+            lookup,
+            known_hosts_path.display()
+        );
+    }
+
+    let confirmed = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt(format!(
+            "Host `{}` is not trusted yet. Fetch its SSH host key and save it to {}?",
+            lookup,
+            known_hosts_path.display()
+        ))
+        .default(true)
+        .interact()
+        .context("host key confirmation aborted")?;
+
+    if !confirmed {
+        bail!("aborted because host `{lookup}` is not trusted yet");
+    }
+
+    add_host_to_known_hosts(server, &known_hosts_path)?;
     Ok(())
 }
 
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
-    let backend = CrosstermBackend::new(stdout);
-    Terminal::new(backend).context("failed to create terminal")
+fn known_hosts_path() -> Result<PathBuf> {
+    let mut path = dirs::home_dir().context("could not determine the home directory")?;
+    path.push(".ssh");
+    path.push("known_hosts");
+    Ok(path)
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
+fn host_exists_in_known_hosts(host: &str, known_hosts_path: &Path) -> Result<bool> {
+    if !known_hosts_path.exists() {
+        return Ok(false);
+    }
+
+    let status = Command::new("ssh-keygen")
+        .arg("-F")
+        .arg(host)
+        .arg("-f")
+        .arg(known_hosts_path)
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to query {} with ssh-keygen",
+                known_hosts_path.display()
+            )
+        })?;
+
+    Ok(status.success())
+}
+
+fn add_host_to_known_hosts(server: &Server, known_hosts_path: &Path) -> Result<()> {
+    let parent = known_hosts_path
+        .parent()
+        .context("known_hosts path should have a parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+
+    let mut scan = Command::new("ssh-keyscan");
+    scan.arg("-H");
+    if server.port != 22 {
+        scan.arg("-p").arg(server.port.to_string());
+    }
+    scan.arg(server.host.trim());
+
+    let output = scan
+        .output()
+        .with_context(|| format!("failed to run ssh-keyscan for `{}`", server.host.trim()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "failed to fetch host key for `{}`: {}",
+            server.host.trim(),
+            stderr.trim()
+        );
+    }
+
+    if output.stdout.is_empty() {
+        bail!(
+            "ssh-keyscan returned no host key data for `{}`",
+            server.host.trim()
+        );
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(known_hosts_path)
+        .with_context(|| format!("failed to open {}", known_hosts_path.display()))?;
+
+    use std::io::Write;
+    file.write_all(&output.stdout)
+        .with_context(|| format!("failed to append to {}", known_hosts_path.display()))?;
+
+    println!(
+        "Saved host key for `{}` to {}.",
+        server.known_hosts_lookup(),
+        known_hosts_path.display()
+    );
     Ok(())
-}
-
-fn print_help() {
-    println!("AshLogin {}", env!("CARGO_PKG_VERSION"));
-    println!();
-    println!("Usage:");
-    println!("  ashlogin           List accounts and log into one");
-    println!("  ashlogin <name>    Log into the named account directly");
-    println!("  ashlogin --conf    Open the TUI config manager");
-    println!("  ashlogin --help    Show this help");
-    println!("  ashlogin --version Show version");
-    println!();
-    println!("Notes:");
-    println!("  - Password auth reads secrets from macOS Keychain");
-    println!("  - Config file path defaults to ~/.config/ashlogin/config.toml");
-}
-
-fn print_version() {
-    println!("ashlogin {}", env!("CARGO_PKG_VERSION"));
 }

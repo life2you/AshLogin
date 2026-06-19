@@ -1,1 +1,4 @@
-/target
+target/
+config.toml
+.DS_Store
+.serena/
