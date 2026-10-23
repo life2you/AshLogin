@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     env, fs,
@@ -15,6 +15,27 @@ const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../config.toml.example");
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Config {
     pub servers: Vec<Server>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerSummary {
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub host: String,
+    pub user: String,
+    pub port: u16,
+    pub target: String,
+    pub description: Option<String>,
+    pub auth_type: String,
+    pub identity_file: Option<String>,
+    pub ssh_options: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SshExecOptions {
+    pub connect_timeout: Option<u64>,
+    pub batch_mode: bool,
+    pub remote_command: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -156,7 +177,34 @@ impl Server {
         self.menu_label()
     }
 
+    pub fn summary(&self) -> ServerSummary {
+        let auth_type = if self.password.is_some() {
+            "password"
+        } else if self.identity_file.is_some() {
+            "identity_file"
+        } else {
+            "default"
+        };
+
+        ServerSummary {
+            name: self.name.clone(),
+            aliases: self.aliases.clone(),
+            host: self.host.clone(),
+            user: self.user.clone(),
+            port: self.port,
+            target: self.target(),
+            description: self.description.clone(),
+            auth_type: auth_type.to_string(),
+            identity_file: self.identity_file.as_ref().map(|p| p.display().to_string()),
+            ssh_options: self.ssh_options.clone(),
+        }
+    }
+
     pub fn preview_command(&self) -> Result<String> {
+        self.preview_command_with_options(&SshExecOptions::default())
+    }
+
+    pub fn preview_command_with_options(&self, options: &SshExecOptions) -> Result<String> {
         let mut parts = Vec::new();
 
         if self.password.is_some() {
@@ -179,16 +227,35 @@ impl Server {
             ));
         }
 
+        if let Some(timeout) = options.connect_timeout {
+            parts.push("-o".to_string());
+            parts.push(shell_quote(&format!("ConnectTimeout={timeout}")));
+        }
+
+        if options.batch_mode && self.password.is_none() {
+            parts.push("-o".to_string());
+            parts.push(shell_quote("BatchMode=yes"));
+        }
+
         for option in &self.ssh_options {
             parts.push("-o".to_string());
             parts.push(shell_quote(option));
         }
 
         parts.push(shell_quote(&self.target()));
+
+        for arg in &options.remote_command {
+            parts.push(shell_quote(arg));
+        }
+
         Ok(parts.join(" "))
     }
 
     pub fn build_ssh_command(&self) -> Result<Command> {
+        self.build_ssh_command_with_options(&SshExecOptions::default())
+    }
+
+    pub fn build_ssh_command_with_options(&self, options: &SshExecOptions) -> Result<Command> {
         let mut command = if let Some(password) = &self.password {
             let mut command = Command::new("sshpass");
             command.arg("-e");
@@ -207,11 +274,24 @@ impl Server {
             command.arg("-i").arg(expand_user_path(identity_file)?);
         }
 
+        if let Some(timeout) = options.connect_timeout {
+            command.arg("-o").arg(format!("ConnectTimeout={timeout}"));
+        }
+
+        if options.batch_mode && self.password.is_none() {
+            command.arg("-o").arg("BatchMode=yes");
+        }
+
         for option in &self.ssh_options {
             command.arg("-o").arg(option);
         }
 
         command.arg(self.target());
+
+        for arg in &options.remote_command {
+            command.arg(arg);
+        }
+
         Ok(command)
     }
 
@@ -224,6 +304,12 @@ impl Server {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
+    }
+}
+
+impl From<&Server> for ServerSummary {
+    fn from(server: &Server) -> Self {
+        server.summary()
     }
 }
 
@@ -307,7 +393,7 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ConfigResolution, Server};
+    use super::{Config, ConfigResolution, Server, ServerSummary, SshExecOptions};
     use std::{
         fs,
         path::PathBuf,
@@ -476,5 +562,136 @@ mod tests {
             }
             ConfigResolution::Ready(_) => panic!("expected created default variant"),
         }
+    }
+
+    #[test]
+    fn summary_sanitizes_password_and_identifies_auth_types() {
+        let pw_server = Server {
+            name: "pw-box".into(),
+            aliases: vec!["pw".into()],
+            host: "10.0.0.1".into(),
+            user: "admin".into(),
+            port: 2222,
+            description: Some("Password box".into()),
+            password: Some("secret123".into()),
+            identity_file: None,
+            ssh_options: vec!["ForwardAgent=no".into()],
+        };
+
+        let summary = pw_server.summary();
+        assert_eq!(summary.name, "pw-box");
+        assert_eq!(summary.aliases, vec!["pw"]);
+        assert_eq!(summary.host, "10.0.0.1");
+        assert_eq!(summary.user, "admin");
+        assert_eq!(summary.port, 2222);
+        assert_eq!(summary.target, "admin@10.0.0.1");
+        assert_eq!(summary.description.as_deref(), Some("Password box"));
+        assert_eq!(summary.auth_type, "password");
+        assert_eq!(summary.identity_file, None);
+        assert_eq!(summary.ssh_options, vec!["ForwardAgent=no"]);
+
+        let json = serde_json::to_string(&summary).expect("summary should serialize");
+        assert!(!json.contains("secret123"));
+        let decoded: ServerSummary =
+            serde_json::from_str(&json).expect("should deserialize back to ServerSummary");
+        assert_eq!(decoded, summary);
+
+        let key_server = Server {
+            name: "key-box".into(),
+            aliases: Vec::new(),
+            host: "10.0.0.2".into(),
+            user: "root".into(),
+            port: 22,
+            description: None,
+            password: None,
+            identity_file: Some(PathBuf::from("~/.ssh/my_key")),
+            ssh_options: Vec::new(),
+        };
+        assert_eq!(key_server.summary().auth_type, "identity_file");
+        assert_eq!(
+            key_server.summary().identity_file.as_deref(),
+            Some("~/.ssh/my_key")
+        );
+
+        let default_server = Server {
+            name: "default-box".into(),
+            aliases: Vec::new(),
+            host: "10.0.0.3".into(),
+            user: "ubuntu".into(),
+            port: 22,
+            description: None,
+            password: None,
+            identity_file: None,
+            ssh_options: Vec::new(),
+        };
+        assert_eq!(default_server.summary().auth_type, "default");
+    }
+
+    #[test]
+    fn preview_command_with_options_handles_timeout_batch_and_remote_command() {
+        let server = Server {
+            name: "prod".into(),
+            aliases: Vec::new(),
+            host: "203.0.113.10".into(),
+            user: "deploy".into(),
+            port: 22,
+            description: None,
+            password: None,
+            identity_file: None,
+            ssh_options: Vec::new(),
+        };
+
+        let options = SshExecOptions {
+            connect_timeout: Some(10),
+            batch_mode: true,
+            remote_command: vec!["echo".into(), "hello world".into()],
+        };
+
+        let preview = server
+            .preview_command_with_options(&options)
+            .expect("preview should build");
+        assert!(preview.contains("-o ConnectTimeout=10"));
+        assert!(preview.contains("-o BatchMode=yes"));
+        assert!(preview.contains("deploy@203.0.113.10"));
+        assert!(preview.contains("echo 'hello world'"));
+    }
+
+    #[test]
+    fn batch_mode_is_skipped_when_password_is_present() {
+        let server = Server {
+            name: "prod".into(),
+            aliases: Vec::new(),
+            host: "203.0.113.10".into(),
+            user: "deploy".into(),
+            port: 22,
+            description: None,
+            password: Some("secret".into()),
+            identity_file: None,
+            ssh_options: Vec::new(),
+        };
+
+        let options = SshExecOptions {
+            connect_timeout: Some(5),
+            batch_mode: true,
+            remote_command: vec!["uptime".into()],
+        };
+
+        let preview = server
+            .preview_command_with_options(&options)
+            .expect("preview should build");
+        assert!(preview.contains("-o ConnectTimeout=5"));
+        assert!(!preview.contains("BatchMode=yes"));
+        assert!(preview.contains("uptime"));
+
+        let command = server
+            .build_ssh_command_with_options(&options)
+            .expect("command should build");
+        let args = command
+            .get_args()
+            .map(|s| s.to_string_lossy())
+            .collect::<Vec<_>>();
+        assert!(!args.iter().any(|arg| arg.contains("BatchMode")));
+        assert!(args.iter().any(|arg| arg == "ConnectTimeout=5"));
+        assert!(args.iter().any(|arg| arg == "uptime"));
     }
 }

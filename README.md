@@ -130,6 +130,153 @@ Use a specific config file:
 ashlogin --config ~/.config/ashlogin/config.toml prod
 ```
 
+## AI Agent & Non-Interactive CLI
+
+AshLogin provides first-class support for non-interactive automation and AI agents:
+
+### Remote command execution
+
+Run commands on remote hosts through AshLogin using `--`:
+
+```bash
+ashlogin prod -- uname -a
+ashlogin prod -- ls -la /var/log
+```
+
+### JSON output (`--json`)
+
+Pass `--json` to receive structured, machine-parseable JSON output.
+
+1. **List configured servers in JSON format**:
+   ```bash
+   ashlogin --list --json
+   ```
+   Outputs an array of desensitized `ServerSummary` objects (passwords are never included):
+   ```json
+   [
+     {
+       "name": "prod",
+       "aliases": ["p"],
+       "host": "203.0.113.10",
+       "user": "deploy",
+       "port": 22,
+       "target": "deploy@203.0.113.10",
+       "description": "Main production host",
+       "auth_type": "identity_file",
+       "identity_file": "~/.ssh/id_ed25519",
+       "ssh_options": ["IdentitiesOnly=yes"]
+     }
+   ]
+   ```
+
+2. **Dry run preview in JSON format**:
+   ```bash
+   ashlogin prod --dry-run --json
+   ashlogin prod --dry-run --json -- uname -a
+   ```
+   Outputs:
+   ```json
+   {
+     "server": "prod",
+     "target": "deploy@203.0.113.10",
+     "port": 22,
+     "uses_password": false,
+     "preview_command": "ssh deploy@203.0.113.10 uname -a",
+     "remote_command": ["uname", "-a"]
+   }
+   ```
+
+3. **Execute remote commands with structured JSON result**:
+   ```bash
+   ashlogin prod --json -- uname -a
+   ```
+   Outputs:
+   ```json
+   {
+     "server": "prod",
+     "target": "deploy@203.0.113.10",
+     "command": ["uname", "-a"],
+     "exit_code": 0,
+     "stdout": "Linux prod 6.1.0 ...\n",
+     "stderr": ""
+   }
+   ```
+
+### Non-interactive flags
+
+- `--trust-host`: Automatically fetches and saves unknown host keys to `~/.ssh/known_hosts` using `ssh-keyscan` without prompting for terminal confirmation.
+- `--connect-timeout <SECONDS>`: Sets SSH connection timeout in seconds (passed to `ssh -o ConnectTimeout=<SECONDS>` and `ssh-keyscan -T <SECONDS>`).
+- `--batch`: Enables non-interactive SSH `BatchMode=yes` for passwordless configurations, failing fast instead of hanging on terminal password prompts.
+
+Example non-interactive invocation:
+
+```bash
+ashlogin prod --trust-host --connect-timeout 10 --batch --json -- uptime
+```
+
+## Model Context Protocol (MCP) Server
+
+AshLogin includes a built-in [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server over `stdio` (`JSON-RPC 2.0`), allowing AI coding assistants and LLM agents to inspect configured servers and execute remote commands safely.
+
+### Starting MCP Server
+
+Both subcommand and flag syntax are supported:
+
+```bash
+ashlogin mcp
+ashlogin --mcp
+ashlogin mcp --config /path/to/custom/config.toml
+```
+
+### Client Configuration
+
+Add AshLogin to your MCP client configuration (e.g. Claude Desktop `claude_desktop_config.json` or Cursor / Cline):
+
+```json
+{
+  "mcpServers": {
+    "ashlogin": {
+      "command": "ashlogin",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Or specifying a dedicated config file:
+
+```json
+{
+  "mcpServers": {
+    "ashlogin": {
+      "command": "ashlogin",
+      "args": ["mcp", "--config", "/Users/you/.config/ashlogin/config.toml"]
+    }
+  }
+}
+```
+
+### Available MCP Tools
+
+1. **`list_servers`**
+   - Lists all configured servers with sanitized summaries (`name`, `aliases`, `host`, `user`, `port`, `target`, `description`, `auth_type`, `identity_file`, `ssh_options`).
+   - Plain-text passwords are never exposed.
+
+2. **`preview_ssh_command`**
+   - Previews the sanitized SSH command without executing it.
+   - Arguments:
+     - `server` (string, required): Server name or alias.
+     - `command` (string or string array, optional): Remote command to execute.
+     - `connect_timeout` (integer, optional): Connection timeout in seconds.
+
+3. **`run_ssh_command`**
+   - Executes a command on the remote server via system `ssh` and captures `stdout`, `stderr`, and `exit_code`.
+   - Arguments:
+     - `server` (string, required): Server name or alias.
+     - `command` (string or string array, required): Command to execute on the remote host.
+     - `connect_timeout` (integer, optional, default: 15): Connection timeout in seconds.
+     - `trust_host` (boolean, optional, default: false): Automatically trust and add unknown host key to `~/.ssh/known_hosts`.
+
 ## Example SSH handoff
 
 Given this config:

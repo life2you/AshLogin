@@ -1,8 +1,9 @@
-mod config;
+pub mod config;
+pub mod mcp;
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
-use config::{Config, ConfigResolution, Server};
+use clap::{Parser, Subcommand};
+use config::{Config, ConfigResolution, Server, ServerSummary, SshExecOptions};
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use std::{
     fs::{self, OpenOptions},
@@ -11,27 +12,69 @@ use std::{
     process::{self, Command},
 };
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum Subcommands {
+    #[command(about = "Start MCP server on stdio")]
+    Mcp,
+}
+
+#[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
     name = "ashlogin",
     version,
     about = "Choose a configured host and hand off to system ssh"
 )]
-struct Cli {
+pub struct Cli {
+    #[command(subcommand)]
+    pub subcommand: Option<Subcommands>,
+
     #[arg(
         value_name = "NAME",
         help = "Server name or alias from the config file"
     )]
-    server: Option<String>,
+    pub server: Option<String>,
 
-    #[arg(long, value_name = "PATH", help = "Use a specific config file")]
-    config: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        help = "Use a specific config file"
+    )]
+    pub config: Option<PathBuf>,
 
     #[arg(long, help = "Print configured servers and exit")]
-    list: bool,
+    pub list: bool,
 
     #[arg(long, help = "Print the final ssh command instead of executing it")]
-    dry_run: bool,
+    pub dry_run: bool,
+
+    #[arg(long, help = "Output as JSON")]
+    pub json: bool,
+
+    #[arg(long, help = "Trust and add unknown host key non-interactively")]
+    pub trust_host: bool,
+
+    #[arg(long, value_name = "SECONDS", help = "SSH connect timeout in seconds")]
+    pub connect_timeout: Option<u64>,
+
+    #[arg(long, help = "Enable non-interactive SSH BatchMode")]
+    pub batch: bool,
+
+    #[arg(long, help = "Start MCP server")]
+    pub mcp: bool,
+
+    #[arg(
+        last = true,
+        value_name = "COMMAND",
+        help = "Command and arguments to execute on the remote server"
+    )]
+    pub command: Vec<String>,
+}
+
+impl Cli {
+    pub fn is_mcp(&self) -> bool {
+        self.mcp || matches!(self.subcommand, Some(Subcommands::Mcp))
+    }
 }
 
 fn main() {
@@ -46,6 +89,28 @@ fn main() {
 
 fn run() -> Result<i32> {
     let cli = Cli::parse();
+
+    if cli.is_mcp() {
+        let config_path = match config::resolve_config_path(cli.config)? {
+            ConfigResolution::Ready(path) => path,
+            ConfigResolution::CreatedDefault(path) => {
+                eprintln!(
+                    "Created a default config at {}.\nEdit that file with your servers.",
+                    path.display()
+                );
+                path
+            }
+        };
+        let config = Config::load_from_path(&config_path)
+            .with_context(|| format!("failed to load {}", config_path.display()))?;
+        mcp::run_mcp_server(config)?;
+        return Ok(0);
+    }
+
+    if cli.json && !cli.list && !cli.dry_run && cli.command.is_empty() {
+        bail!("--json requires --list, --dry-run, or a remote command (-- <COMMAND>...)");
+    }
+
     let config_path = match config::resolve_config_path(cli.config)? {
         ConfigResolution::Ready(path) => path,
         ConfigResolution::CreatedDefault(path) => {
@@ -60,7 +125,14 @@ fn run() -> Result<i32> {
         .with_context(|| format!("failed to load {}", config_path.display()))?;
 
     if cli.list {
-        print_servers(&config);
+        if cli.json {
+            let summaries: Vec<ServerSummary> =
+                config.servers.iter().map(ServerSummary::from).collect();
+            let json = serde_json::to_string_pretty(&summaries)?;
+            println!("{json}");
+        } else {
+            print_servers(&config);
+        }
         return Ok(0);
     }
 
@@ -69,14 +141,72 @@ fn run() -> Result<i32> {
         None => select_server(&config)?,
     };
 
+    if cli.batch && server.uses_password_auth() {
+        eprintln!(
+            "warning: --batch is ignored for password-authenticated server `{}`",
+            server.name
+        );
+    }
+
+    let exec_options = SshExecOptions {
+        connect_timeout: cli.connect_timeout,
+        batch_mode: cli.batch,
+        remote_command: cli.command.clone(),
+    };
+
     if cli.dry_run {
-        println!("{}", server.preview_command()?);
+        let preview = server.preview_command_with_options(&exec_options)?;
+        if cli.json {
+            let output = serde_json::json!({
+                "server": server.name,
+                "target": server.target(),
+                "port": server.port,
+                "uses_password": server.uses_password_auth(),
+                "preview_command": preview,
+                "remote_command": cli.command,
+            });
+            let json = serde_json::to_string_pretty(&output)?;
+            println!("{json}");
+        } else {
+            println!("{preview}");
+        }
         return Ok(0);
     }
 
     ensure_runtime_requirements(server)?;
-    ensure_known_host(server)?;
-    launch_ssh(server)
+    ensure_known_host(server, cli.trust_host, cli.connect_timeout, cli.json)?;
+
+    if !cli.command.is_empty() {
+        let mut command = server.build_ssh_command_with_options(&exec_options)?;
+        if cli.json {
+            command.stdin(std::process::Stdio::null());
+            let output = command.output().with_context(|| {
+                format!("failed to execute remote command on `{}`", server.name)
+            })?;
+            let exit_code = output.status.code().unwrap_or(1);
+            let stdout_str = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr_str = String::from_utf8_lossy(&output.stderr).to_string();
+
+            let result = serde_json::json!({
+                "server": server.name,
+                "target": server.target(),
+                "command": cli.command,
+                "exit_code": exit_code,
+                "stdout": stdout_str,
+                "stderr": stderr_str,
+            });
+            let json = serde_json::to_string_pretty(&result)?;
+            println!("{json}");
+            return Ok(exit_code);
+        }
+
+        let status = command
+            .status()
+            .with_context(|| format!("failed to execute remote command on `{}`", server.name))?;
+        return Ok(status.code().unwrap_or(1));
+    }
+
+    launch_ssh(server, &exec_options)
 }
 
 fn print_servers(config: &Config) {
@@ -112,15 +242,15 @@ fn select_server(config: &Config) -> Result<&Server> {
     Ok(&config.servers[selected])
 }
 
-fn launch_ssh(server: &Server) -> Result<i32> {
-    let mut command = server.build_ssh_command()?;
+fn launch_ssh(server: &Server, options: &SshExecOptions) -> Result<i32> {
+    let mut command = server.build_ssh_command_with_options(options)?;
     let status = command
         .status()
         .with_context(|| format!("failed to launch ssh for `{}`", server.name))?;
     Ok(status.code().unwrap_or(1))
 }
 
-fn ensure_runtime_requirements(server: &Server) -> Result<()> {
+pub fn ensure_runtime_requirements(server: &Server) -> Result<()> {
     if server.uses_password_auth() && !command_exists("sshpass") {
         bail!(
             "server `{}` uses password auth, but `sshpass` was not found in PATH",
@@ -131,7 +261,7 @@ fn ensure_runtime_requirements(server: &Server) -> Result<()> {
     Ok(())
 }
 
-fn command_exists(program: &str) -> bool {
+pub fn command_exists(program: &str) -> bool {
     Command::new(program)
         .arg("-V")
         .output()
@@ -139,7 +269,12 @@ fn command_exists(program: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn ensure_known_host(server: &Server) -> Result<()> {
+pub fn ensure_known_host(
+    server: &Server,
+    trust_host: bool,
+    connect_timeout: Option<u64>,
+    quiet: bool,
+) -> Result<()> {
     let known_hosts_path = known_hosts_path()?;
     let lookup = server.known_hosts_lookup();
 
@@ -147,10 +282,14 @@ fn ensure_known_host(server: &Server) -> Result<()> {
         return Ok(());
     }
 
+    if trust_host {
+        add_host_to_known_hosts(server, &known_hosts_path, connect_timeout, quiet)?;
+        return Ok(());
+    }
+
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!(
-            "host `{}` is not present in {}. run interactively once to confirm and save its host key",
-            lookup,
+            "host `{lookup}` is not present in {}. run interactively once to confirm and save its host key or use --trust-host",
             known_hosts_path.display()
         );
     }
@@ -169,28 +308,28 @@ fn ensure_known_host(server: &Server) -> Result<()> {
         bail!("aborted because host `{lookup}` is not trusted yet");
     }
 
-    add_host_to_known_hosts(server, &known_hosts_path)?;
+    add_host_to_known_hosts(server, &known_hosts_path, connect_timeout, quiet)?;
     Ok(())
 }
 
-fn known_hosts_path() -> Result<PathBuf> {
+pub fn known_hosts_path() -> Result<PathBuf> {
     let mut path = dirs::home_dir().context("could not determine the home directory")?;
     path.push(".ssh");
     path.push("known_hosts");
     Ok(path)
 }
 
-fn host_exists_in_known_hosts(host: &str, known_hosts_path: &Path) -> Result<bool> {
+pub fn host_exists_in_known_hosts(host: &str, known_hosts_path: &Path) -> Result<bool> {
     if !known_hosts_path.exists() {
         return Ok(false);
     }
 
-    let status = Command::new("ssh-keygen")
+    let output = Command::new("ssh-keygen")
         .arg("-F")
         .arg(host)
         .arg("-f")
         .arg(known_hosts_path)
-        .status()
+        .output()
         .with_context(|| {
             format!(
                 "failed to query {} with ssh-keygen",
@@ -198,16 +337,24 @@ fn host_exists_in_known_hosts(host: &str, known_hosts_path: &Path) -> Result<boo
             )
         })?;
 
-    Ok(status.success())
+    Ok(output.status.success())
 }
 
-fn add_host_to_known_hosts(server: &Server, known_hosts_path: &Path) -> Result<()> {
+pub fn add_host_to_known_hosts(
+    server: &Server,
+    known_hosts_path: &Path,
+    connect_timeout: Option<u64>,
+    quiet: bool,
+) -> Result<()> {
     let parent = known_hosts_path
         .parent()
         .context("known_hosts path should have a parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
 
     let mut scan = Command::new("ssh-keyscan");
+    if let Some(timeout) = connect_timeout {
+        scan.arg("-T").arg(timeout.to_string());
+    }
     scan.arg("-H");
     if server.port != 22 {
         scan.arg("-p").arg(server.port.to_string());
@@ -244,10 +391,128 @@ fn add_host_to_known_hosts(server: &Server, known_hosts_path: &Path) -> Result<(
     file.write_all(&output.stdout)
         .with_context(|| format!("failed to append to {}", known_hosts_path.display()))?;
 
-    println!(
-        "Saved host key for `{}` to {}.",
-        server.known_hosts_lookup(),
-        known_hosts_path.display()
-    );
+    if quiet {
+        eprintln!(
+            "Saved host key for `{}` to {}.",
+            server.known_hosts_lookup(),
+            known_hosts_path.display()
+        );
+    } else {
+        println!(
+            "Saved host key for `{}` to {}.",
+            server.known_hosts_lookup(),
+            known_hosts_path.display()
+        );
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_parsing_no_args() {
+        let cli = Cli::try_parse_from(["ashlogin"]).expect("should parse");
+        assert_eq!(cli.server, None);
+        assert!(cli.command.is_empty());
+        assert!(!cli.is_mcp());
+        assert!(!cli.list);
+        assert!(!cli.dry_run);
+        assert!(!cli.json);
+        assert!(!cli.trust_host);
+        assert_eq!(cli.connect_timeout, None);
+        assert!(!cli.batch);
+    }
+
+    #[test]
+    fn test_cli_parsing_server_only() {
+        let cli = Cli::try_parse_from(["ashlogin", "prod"]).expect("should parse");
+        assert_eq!(cli.server.as_deref(), Some("prod"));
+        assert!(cli.command.is_empty());
+        assert!(!cli.is_mcp());
+    }
+
+    #[test]
+    fn test_cli_parsing_server_with_remote_command() {
+        let cli =
+            Cli::try_parse_from(["ashlogin", "prod", "--", "uname", "-a"]).expect("should parse");
+        assert_eq!(cli.server.as_deref(), Some("prod"));
+        assert_eq!(cli.command, vec!["uname", "-a"]);
+        assert!(!cli.is_mcp());
+    }
+
+    #[test]
+    fn test_cli_parsing_mcp_subcommand() {
+        let cli = Cli::try_parse_from(["ashlogin", "mcp"]).expect("should parse");
+        assert!(cli.is_mcp());
+        assert_eq!(cli.subcommand, Some(Subcommands::Mcp));
+        assert_eq!(cli.server, None);
+    }
+
+    #[test]
+    fn test_cli_parsing_mcp_flag() {
+        let cli = Cli::try_parse_from(["ashlogin", "--mcp"]).expect("should parse");
+        assert!(cli.is_mcp());
+        assert!(cli.mcp);
+    }
+
+    #[test]
+    fn test_cli_parsing_mcp_with_config() {
+        let cli1 = Cli::try_parse_from(["ashlogin", "mcp", "--config", "myconfig.toml"])
+            .expect("should parse");
+        assert!(cli1.is_mcp());
+        assert_eq!(cli1.config, Some(PathBuf::from("myconfig.toml")));
+
+        let cli2 = Cli::try_parse_from(["ashlogin", "--config", "myconfig.toml", "mcp"])
+            .expect("should parse");
+        assert!(cli2.is_mcp());
+        assert_eq!(cli2.config, Some(PathBuf::from("myconfig.toml")));
+    }
+
+    #[test]
+    fn test_cli_parsing_all_flags() {
+        let cli = Cli::try_parse_from([
+            "ashlogin",
+            "prod",
+            "--json",
+            "--trust-host",
+            "--connect-timeout",
+            "10",
+            "--batch",
+            "--",
+            "whoami",
+        ])
+        .expect("should parse");
+
+        assert_eq!(cli.server.as_deref(), Some("prod"));
+        assert!(cli.json);
+        assert!(cli.trust_host);
+        assert_eq!(cli.connect_timeout, Some(10));
+        assert!(cli.batch);
+        assert_eq!(cli.command, vec!["whoami"]);
+    }
+
+    #[test]
+    fn test_json_flag_requires_list_dry_run_or_remote_command() {
+        // When --json is passed without --list, --dry-run, or remote command
+        let cli = Cli::try_parse_from(["ashlogin", "prod", "--json"]).expect("should parse CLI");
+        let requires_error = cli.json && !cli.list && !cli.dry_run && cli.command.is_empty();
+        assert!(requires_error);
+
+        // When remote command is present
+        let cli = Cli::try_parse_from(["ashlogin", "prod", "--json", "--", "ls"]).unwrap();
+        let requires_error = cli.json && !cli.list && !cli.dry_run && cli.command.is_empty();
+        assert!(!requires_error);
+
+        // When --list is present
+        let cli = Cli::try_parse_from(["ashlogin", "--list", "--json"]).unwrap();
+        let requires_error = cli.json && !cli.list && !cli.dry_run && cli.command.is_empty();
+        assert!(!requires_error);
+
+        // When --dry-run is present
+        let cli = Cli::try_parse_from(["ashlogin", "prod", "--dry-run", "--json"]).unwrap();
+        let requires_error = cli.json && !cli.list && !cli.dry_run && cli.command.is_empty();
+        assert!(!requires_error);
+    }
 }
