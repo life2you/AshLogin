@@ -200,6 +200,7 @@ impl Server {
         }
     }
 
+    #[cfg(test)]
     pub fn preview_command(&self) -> Result<String> {
         self.preview_command_with_options(&SshExecOptions::default())
     }
@@ -251,6 +252,7 @@ impl Server {
         Ok(parts.join(" "))
     }
 
+    #[cfg(test)]
     pub fn build_ssh_command(&self) -> Result<Command> {
         self.build_ssh_command_with_options(&SshExecOptions::default())
     }

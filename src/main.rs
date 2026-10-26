@@ -1,8 +1,7 @@
-pub mod config;
-pub mod mcp;
+mod config;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use config::{Config, ConfigResolution, Server, ServerSummary, SshExecOptions};
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use std::{
@@ -12,69 +11,46 @@ use std::{
     process::{self, Command},
 };
 
-#[derive(Debug, Subcommand, PartialEq, Eq)]
-pub enum Subcommands {
-    #[command(about = "Start MCP server on stdio")]
-    Mcp,
-}
-
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(
     name = "ashlogin",
     version,
     about = "Choose a configured host and hand off to system ssh"
 )]
-pub struct Cli {
-    #[command(subcommand)]
-    pub subcommand: Option<Subcommands>,
-
+struct Cli {
     #[arg(
         value_name = "NAME",
         help = "Server name or alias from the config file"
     )]
-    pub server: Option<String>,
+    server: Option<String>,
 
-    #[arg(
-        long,
-        global = true,
-        value_name = "PATH",
-        help = "Use a specific config file"
-    )]
-    pub config: Option<PathBuf>,
+    #[arg(long, value_name = "PATH", help = "Use a specific config file")]
+    config: Option<PathBuf>,
 
     #[arg(long, help = "Print configured servers and exit")]
-    pub list: bool,
+    list: bool,
 
     #[arg(long, help = "Print the final ssh command instead of executing it")]
-    pub dry_run: bool,
+    dry_run: bool,
 
     #[arg(long, help = "Output as JSON")]
-    pub json: bool,
+    json: bool,
 
     #[arg(long, help = "Trust and add unknown host key non-interactively")]
-    pub trust_host: bool,
+    trust_host: bool,
 
     #[arg(long, value_name = "SECONDS", help = "SSH connect timeout in seconds")]
-    pub connect_timeout: Option<u64>,
+    connect_timeout: Option<u64>,
 
     #[arg(long, help = "Enable non-interactive SSH BatchMode")]
-    pub batch: bool,
-
-    #[arg(long, help = "Start MCP server")]
-    pub mcp: bool,
+    batch: bool,
 
     #[arg(
         last = true,
         value_name = "COMMAND",
         help = "Command and arguments to execute on the remote server"
     )]
-    pub command: Vec<String>,
-}
-
-impl Cli {
-    pub fn is_mcp(&self) -> bool {
-        self.mcp || matches!(self.subcommand, Some(Subcommands::Mcp))
-    }
+    command: Vec<String>,
 }
 
 fn main() {
@@ -89,23 +65,6 @@ fn main() {
 
 fn run() -> Result<i32> {
     let cli = Cli::parse();
-
-    if cli.is_mcp() {
-        let config_path = match config::resolve_config_path(cli.config)? {
-            ConfigResolution::Ready(path) => path,
-            ConfigResolution::CreatedDefault(path) => {
-                eprintln!(
-                    "Created a default config at {}.\nEdit that file with your servers.",
-                    path.display()
-                );
-                path
-            }
-        };
-        let config = Config::load_from_path(&config_path)
-            .with_context(|| format!("failed to load {}", config_path.display()))?;
-        mcp::run_mcp_server(config)?;
-        return Ok(0);
-    }
 
     if cli.json && !cli.list && !cli.dry_run && cli.command.is_empty() {
         bail!("--json requires --list, --dry-run, or a remote command (-- <COMMAND>...)");
@@ -250,7 +209,7 @@ fn launch_ssh(server: &Server, options: &SshExecOptions) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
-pub fn ensure_runtime_requirements(server: &Server) -> Result<()> {
+fn ensure_runtime_requirements(server: &Server) -> Result<()> {
     if server.uses_password_auth() && !command_exists("sshpass") {
         bail!(
             "server `{}` uses password auth, but `sshpass` was not found in PATH",
@@ -261,7 +220,7 @@ pub fn ensure_runtime_requirements(server: &Server) -> Result<()> {
     Ok(())
 }
 
-pub fn command_exists(program: &str) -> bool {
+fn command_exists(program: &str) -> bool {
     Command::new(program)
         .arg("-V")
         .output()
@@ -269,7 +228,7 @@ pub fn command_exists(program: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn ensure_known_host(
+fn ensure_known_host(
     server: &Server,
     trust_host: bool,
     connect_timeout: Option<u64>,
@@ -312,14 +271,14 @@ pub fn ensure_known_host(
     Ok(())
 }
 
-pub fn known_hosts_path() -> Result<PathBuf> {
+fn known_hosts_path() -> Result<PathBuf> {
     let mut path = dirs::home_dir().context("could not determine the home directory")?;
     path.push(".ssh");
     path.push("known_hosts");
     Ok(path)
 }
 
-pub fn host_exists_in_known_hosts(host: &str, known_hosts_path: &Path) -> Result<bool> {
+fn host_exists_in_known_hosts(host: &str, known_hosts_path: &Path) -> Result<bool> {
     if !known_hosts_path.exists() {
         return Ok(false);
     }
@@ -340,7 +299,7 @@ pub fn host_exists_in_known_hosts(host: &str, known_hosts_path: &Path) -> Result
     Ok(output.status.success())
 }
 
-pub fn add_host_to_known_hosts(
+fn add_host_to_known_hosts(
     server: &Server,
     known_hosts_path: &Path,
     connect_timeout: Option<u64>,
@@ -416,7 +375,6 @@ mod tests {
         let cli = Cli::try_parse_from(["ashlogin"]).expect("should parse");
         assert_eq!(cli.server, None);
         assert!(cli.command.is_empty());
-        assert!(!cli.is_mcp());
         assert!(!cli.list);
         assert!(!cli.dry_run);
         assert!(!cli.json);
@@ -430,7 +388,6 @@ mod tests {
         let cli = Cli::try_parse_from(["ashlogin", "prod"]).expect("should parse");
         assert_eq!(cli.server.as_deref(), Some("prod"));
         assert!(cli.command.is_empty());
-        assert!(!cli.is_mcp());
     }
 
     #[test]
@@ -439,35 +396,6 @@ mod tests {
             Cli::try_parse_from(["ashlogin", "prod", "--", "uname", "-a"]).expect("should parse");
         assert_eq!(cli.server.as_deref(), Some("prod"));
         assert_eq!(cli.command, vec!["uname", "-a"]);
-        assert!(!cli.is_mcp());
-    }
-
-    #[test]
-    fn test_cli_parsing_mcp_subcommand() {
-        let cli = Cli::try_parse_from(["ashlogin", "mcp"]).expect("should parse");
-        assert!(cli.is_mcp());
-        assert_eq!(cli.subcommand, Some(Subcommands::Mcp));
-        assert_eq!(cli.server, None);
-    }
-
-    #[test]
-    fn test_cli_parsing_mcp_flag() {
-        let cli = Cli::try_parse_from(["ashlogin", "--mcp"]).expect("should parse");
-        assert!(cli.is_mcp());
-        assert!(cli.mcp);
-    }
-
-    #[test]
-    fn test_cli_parsing_mcp_with_config() {
-        let cli1 = Cli::try_parse_from(["ashlogin", "mcp", "--config", "myconfig.toml"])
-            .expect("should parse");
-        assert!(cli1.is_mcp());
-        assert_eq!(cli1.config, Some(PathBuf::from("myconfig.toml")));
-
-        let cli2 = Cli::try_parse_from(["ashlogin", "--config", "myconfig.toml", "mcp"])
-            .expect("should parse");
-        assert!(cli2.is_mcp());
-        assert_eq!(cli2.config, Some(PathBuf::from("myconfig.toml")));
     }
 
     #[test]

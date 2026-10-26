@@ -214,69 +214,6 @@ Example non-interactive invocation:
 ashlogin prod --trust-host --connect-timeout 10 --batch --json -- uptime
 ```
 
-## Model Context Protocol (MCP) Server
-
-AshLogin includes a built-in [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server over `stdio` (`JSON-RPC 2.0`), allowing AI coding assistants and LLM agents to inspect configured servers and execute remote commands safely.
-
-### Starting MCP Server
-
-Both subcommand and flag syntax are supported:
-
-```bash
-ashlogin mcp
-ashlogin --mcp
-ashlogin mcp --config /path/to/custom/config.toml
-```
-
-### Client Configuration
-
-Add AshLogin to your MCP client configuration (e.g. Claude Desktop `claude_desktop_config.json` or Cursor / Cline):
-
-```json
-{
-  "mcpServers": {
-    "ashlogin": {
-      "command": "ashlogin",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-Or specifying a dedicated config file:
-
-```json
-{
-  "mcpServers": {
-    "ashlogin": {
-      "command": "ashlogin",
-      "args": ["mcp", "--config", "/Users/you/.config/ashlogin/config.toml"]
-    }
-  }
-}
-```
-
-### Available MCP Tools
-
-1. **`list_servers`**
-   - Lists all configured servers with sanitized summaries (`name`, `aliases`, `host`, `user`, `port`, `target`, `description`, `auth_type`, `identity_file`, `ssh_options`).
-   - Plain-text passwords are never exposed.
-
-2. **`preview_ssh_command`**
-   - Previews the sanitized SSH command without executing it.
-   - Arguments:
-     - `server` (string, required): Server name or alias.
-     - `command` (string or string array, optional): Remote command to execute.
-     - `connect_timeout` (integer, optional): Connection timeout in seconds.
-
-3. **`run_ssh_command`**
-   - Executes a command on the remote server via system `ssh` and captures `stdout`, `stderr`, and `exit_code`.
-   - Arguments:
-     - `server` (string, required): Server name or alias.
-     - `command` (string or string array, required): Command to execute on the remote host.
-     - `connect_timeout` (integer, optional, default: 15): Connection timeout in seconds.
-     - `trust_host` (boolean, optional, default: false): Automatically trust and add unknown host key to `~/.ssh/known_hosts`.
-
 ## Example SSH handoff
 
 Given this config:
